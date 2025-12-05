@@ -7,6 +7,18 @@
   "files": [
     "dist"
   ],
+  "author": {
+    "name": "Ivan Zorin (localzet)",
+    "email": "creator@localzet.com",
+    "url": "https://localzet.com"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/localzet/secure-channel.git"
+  },
+  "bugs": {
+    "url": "https://github.com/localzet/secure-channel/issues"
+  },
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch"
@@ -23,4 +35,3 @@
     "typescript": "^5.9.2"
   }
 }
-
