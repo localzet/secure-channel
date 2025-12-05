@@ -32,6 +32,9 @@ export interface SecureChannelClientOptions {
   caCertificate?: string // PEM
   reconnectDelayMs?: number
   requestTimeoutMs?: number
+  maxSkewMs?: number
+  nonceTtlMs?: number
+  nonceCacheSize?: number
 }
 
 export interface RequestOptions {
@@ -53,12 +56,16 @@ export class SecureChannelClient extends EventEmitter {
     string,
     { resolve: (v: any) => void; reject: (e: any) => void; timeout: NodeJS.Timeout }
   >()
+  private readonly nonces = new Map<string, number>()
 
   constructor(options: SecureChannelClientOptions) {
     super()
     this.opts = {
       reconnectDelayMs: options.reconnectDelayMs ?? 3000,
       requestTimeoutMs: options.requestTimeoutMs ?? 5000,
+      maxSkewMs: options.maxSkewMs ?? 30_000,
+      nonceTtlMs: options.nonceTtlMs ?? 60_000,
+      nonceCacheSize: options.nonceCacheSize ?? 10_000,
       ...options,
     } as Required<SecureChannelClientOptions>
   }
@@ -123,12 +130,19 @@ export class SecureChannelClient extends EventEmitter {
         this.pending.set(id, { resolve, reject, timeout })
       }
 
+      const now = Date.now()
+      const nonce = randomUUID()
+
       const msg: ChannelMessage = {
         type: 'request',
         id,
         route: options.route,
         expectReply,
-        headers: options.headers,
+        headers: {
+          'x-sc-ts': now.toString(),
+          'x-sc-nonce': nonce,
+          ...options.headers,
+        },
         payload: options.payload,
       }
       this.ws!.send(JSON.stringify(msg))
@@ -203,6 +217,9 @@ export interface SecureChannelServerOptions {
   wss: WebSocketServer
   verifyClient?: (peerCert: any) => boolean
   onRequest: (route: string, payload: any, raw: ChannelMessage) => Promise<any>
+  maxSkewMs?: number
+  nonceTtlMs?: number
+  nonceCacheSize?: number
 }
 
 /**
@@ -210,9 +227,17 @@ export interface SecureChannelServerOptions {
  */
 export function bindSecureChannelServer(options: SecureChannelServerOptions): void {
   const { wss, verifyClient, onRequest } = options
+  const maxSkewMs = options.maxSkewMs ?? 30_000
+  const nonceTtlMs = options.nonceTtlMs ?? 60_000
+  const nonceCacheSize = options.nonceCacheSize ?? 10_000
+  const seenNonces = new Map<string, number>()
 
   wss.on('connection', (ws, req) => {
     const cert = (req.socket as any).getPeerCertificate ? (req.socket as any).getPeerCertificate() : null
+    if ((req.socket as any).authorized === false) {
+      ws.close(4001, 'Unauthorized client certificate')
+      return
+    }
     if (verifyClient && !verifyClient(cert)) {
       ws.close(4001, 'Invalid client certificate')
       return
@@ -226,6 +251,23 @@ export function bindSecureChannelServer(options: SecureChannelServerOptions): vo
         return
       }
       if (!msg || msg.type !== 'request' || !msg.id || !msg.route) return
+
+      // Anti-replay: timestamp + nonce window
+      const tsStr = msg.headers?.['x-sc-ts']
+      const nonce = msg.headers?.['x-sc-nonce']
+      const now = Date.now()
+      if (!tsStr || !nonce) return
+      const ts = Number(tsStr)
+      if (!Number.isFinite(ts) || Math.abs(now - ts) > maxSkewMs) return
+      // purge old nonces
+      if (seenNonces.size > nonceCacheSize) {
+        const cutoff = now - nonceTtlMs
+        for (const [n, t] of seenNonces) {
+          if (t < cutoff) seenNonces.delete(n)
+        }
+      }
+      if (seenNonces.has(nonce)) return
+      seenNonces.set(nonce, ts)
 
       let statusCode = 200
       let payload: any = null
