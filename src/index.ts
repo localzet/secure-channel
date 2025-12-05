@@ -1,28 +1,20 @@
 /**
- * Secure Channel Protocol
- * Hybrid WebSocket/HTTP protocol for secure service communication
+ * Secure Channel Protocol (client + lightweight server helper).
+ * Matches current Gateway/Security flow: request/response + events/commands over mTLS WebSocket.
  */
 
-import WebSocket from 'ws'
+import WebSocket, { WebSocketServer } from 'ws'
 import { EventEmitter } from 'events'
 
-export interface SecureChannelOptions {
-  gatewayUrl: string
-  serviceId: string
-  certificate: string // PEM format
-  privateKey: string // PEM format
-  caCertificate?: string // Root CA certificate
-}
-
-export interface RequestOptions {
-  route: string
-  expectReply?: boolean
-  headers?: Record<string, string>
-  payload?: any
-}
+export type ChannelMessageType =
+  | 'request'
+  | 'response'
+  | 'event'
+  | 'command'
+  | 'command-result'
 
 export interface ChannelMessage {
-  type: 'request' | 'response' | 'event' | 'command' | 'command-result'
+  type: ChannelMessageType
   id?: string
   route?: string
   expectReply?: boolean
@@ -32,191 +24,228 @@ export interface ChannelMessage {
   error?: string
 }
 
-/**
- * Secure Channel Client
- * Supports both request/response and full-duplex event streaming
- */
-export class SecureChannel extends EventEmitter {
-  private ws: WebSocket | null = null
-  private gatewayUrl: string
-  private serviceId: string
-  private certificate: string
-  private privateKey: string
-  private caCertificate?: string
-  private connected = false
-  private pendingRequests = new Map<string, {
-    resolve: (value: any) => void
-    reject: (error: Error) => void
-    timeout: NodeJS.Timeout
-  }>()
+export interface SecureChannelClientOptions {
+  url: string
+  serviceId: string
+  certificate: string // PEM
+  privateKey: string // PEM
+  caCertificate?: string // PEM
+  reconnectDelayMs?: number
+  requestTimeoutMs?: number
+}
 
-  constructor(options: SecureChannelOptions) {
+export interface RequestOptions {
+  route: string
+  payload?: any
+  expectReply?: boolean
+  headers?: Record<string, string>
+  timeoutMs?: number
+}
+
+/**
+ * Client with auto-reconnect and pending request tracking.
+ */
+export class SecureChannelClient extends EventEmitter {
+  private ws: WebSocket | null = null
+  private connected = false
+  private readonly opts: Required<SecureChannelClientOptions>
+  private readonly pending = new Map<
+    string,
+    { resolve: (v: any) => void; reject: (e: any) => void; timeout: NodeJS.Timeout }
+  >()
+
+  constructor(options: SecureChannelClientOptions) {
     super()
-    this.gatewayUrl = options.gatewayUrl
-    this.serviceId = options.serviceId
-    this.certificate = options.certificate
-    this.privateKey = options.privateKey
-    this.caCertificate = options.caCertificate
+    this.opts = {
+      reconnectDelayMs: options.reconnectDelayMs ?? 3000,
+      requestTimeoutMs: options.requestTimeoutMs ?? 5000,
+      ...options,
+    } as Required<SecureChannelClientOptions>
   }
 
-  /**
-   * Connect to Gateway via secure channel
-   */
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      try {
-        const url = this.gatewayUrl.replace('https://', 'wss://').replace('http://', 'ws://')
-        const wsUrl = `${url}/secure-channel/${this.serviceId}`
+      const wsUrl = this.opts.url.replace(/^http(s?)/, 'ws$1')
+      const target = wsUrl.endsWith('/')
+        ? `${wsUrl}secure-channel/${this.opts.serviceId}`
+        : `${wsUrl}/secure-channel/${this.opts.serviceId}`
 
-        // Create WebSocket connection with TLS client certificate
-        const ws = new WebSocket(wsUrl, {
-          cert: this.certificate,
-          key: this.privateKey,
-          ca: this.caCertificate,
-          rejectUnauthorized: !!this.caCertificate,
-        })
+      const ws = new WebSocket(target, {
+        cert: this.opts.certificate,
+        key: this.opts.privateKey,
+        ca: this.opts.caCertificate ? [this.opts.caCertificate] : undefined,
+        rejectUnauthorized: !!this.opts.caCertificate,
+      })
 
-        ws.on('open', () => {
-          this.ws = ws
-          this.connected = true
-          this.emit('connected')
-          resolve()
-        })
+      ws.on('open', () => {
+        this.ws = ws
+        this.connected = true
+        this.emit('connected')
+        resolve()
+      })
 
-        ws.on('message', (data: Buffer) => {
-          try {
-            const message: ChannelMessage = JSON.parse(data.toString())
-            this.handleMessage(message)
-          } catch (error) {
-            console.error('Failed to parse message:', error)
-          }
-        })
+      ws.on('message', (data: Buffer) => {
+        try {
+          const msg = JSON.parse(data.toString()) as ChannelMessage
+          this.handleMessage(msg)
+        } catch (err) {
+          this.emit('error', err)
+        }
+      })
 
-        ws.on('error', (error) => {
-          this.connected = false
-          this.emit('error', error)
-          reject(error)
-        })
+      ws.on('error', (err) => {
+        this.connected = false
+        this.emit('error', err)
+        reject(err)
+      })
 
-        ws.on('close', () => {
-          this.connected = false
-          this.emit('disconnected')
-          // Auto-reconnect
-          setTimeout(() => {
-            if (!this.connected) {
-              this.connect().catch(console.error)
-            }
-          }, 5000)
-        })
-      } catch (error) {
-        reject(error)
-      }
+      ws.on('close', () => {
+        this.connected = false
+        this.emit('disconnected')
+        setTimeout(() => this.connect().catch(() => {}), this.opts.reconnectDelayMs)
+      })
     })
   }
 
-  /**
-   * Send request (request/response mode)
-   */
   async request(options: RequestOptions): Promise<any> {
-    if (!this.connected || !this.ws) {
-      throw new Error('Channel not connected')
-    }
+    if (!this.connected || !this.ws) throw new Error('Channel not connected')
 
-    const requestId = `req_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`
+    const id = `req_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
     const expectReply = options.expectReply !== false
+    const timeoutMs = options.timeoutMs ?? this.opts.requestTimeoutMs
 
     return new Promise((resolve, reject) => {
-      let timeout: NodeJS.Timeout | undefined
-
       if (expectReply) {
-        timeout = setTimeout(() => {
-          this.pendingRequests.delete(requestId)
+        const timeout = setTimeout(() => {
+          this.pending.delete(id)
           reject(new Error('Request timeout'))
-        }, 30000) // 30 seconds
-
-        this.pendingRequests.set(requestId, { resolve, reject, timeout })
+        }, timeoutMs)
+        this.pending.set(id, { resolve, reject, timeout })
       }
 
-      const message: ChannelMessage = {
+      const msg: ChannelMessage = {
         type: 'request',
-        id: requestId,
+        id,
         route: options.route,
         expectReply,
         headers: options.headers,
         payload: options.payload,
       }
+      this.ws!.send(JSON.stringify(msg))
 
-      this.ws!.send(JSON.stringify(message))
-
-      if (!expectReply) {
-        resolve({ accepted: true })
-      }
+      if (!expectReply) resolve({ accepted: true })
     })
   }
 
-  /**
-   * Send event (full-duplex mode)
-   */
-  send(data: { route?: string; payload?: any }): void {
-    if (!this.connected || !this.ws) {
-      throw new Error('Channel not connected')
-    }
-
-    const message: ChannelMessage = {
-      type: 'event',
-      route: data.route,
-      payload: data.payload ?? data,
-    }
-
-    this.ws.send(JSON.stringify(message))
+  sendEvent(route: string, payload?: any): void {
+    if (!this.connected || !this.ws) throw new Error('Channel not connected')
+    const msg: ChannelMessage = { type: 'event', route, payload }
+    this.ws.send(JSON.stringify(msg))
   }
 
-  /**
-   * Handle incoming messages
-   */
-  private handleMessage(message: ChannelMessage): void {
-    if (message.type === 'response' && message.id) {
-      // Handle request/response
-      const pending = this.pendingRequests.get(message.id)
-      if (pending) {
-        clearTimeout(pending.timeout)
-        this.pendingRequests.delete(message.id)
-
-        const ok = message.statusCode === undefined || (message.statusCode >= 200 && message.statusCode < 300)
-        ok ? pending.resolve(message.payload) : pending.reject(new Error(message.error || `Request failed with status ${message.statusCode}`))
-      }
-    } else if (message.type === 'command') {
-      // Handle commands from Gateway
-      this.emit('command', message)
-    } else if (message.type === 'command-result') {
-      this.emit('command-result', message)
-    } else if (message.type === 'event') {
-      // Handle events
-      this.emit('message', message)
+  sendCommand(route: string, payload?: any, expectReply = true): Promise<any> | void {
+    if (!this.connected || !this.ws) throw new Error('Channel not connected')
+    if (!expectReply) {
+      this.ws.send(JSON.stringify({ type: 'command', route, payload }))
+      return
     }
+    return this.request({ route, payload, expectReply: true })
   }
 
-  /**
-   * Disconnect
-   */
   disconnect(): void {
     if (this.ws) {
       this.ws.close()
       this.ws = null
     }
     this.connected = false
-    this.pendingRequests.forEach(({ timeout, reject }) => {
+    this.pending.forEach(({ timeout, reject }) => {
       clearTimeout(timeout)
       reject(new Error('Channel disconnected'))
     })
-    this.pendingRequests.clear()
+    this.pending.clear()
   }
 
-  /**
-   * Check if connected
-   */
   isConnected(): boolean {
     return this.connected
   }
+
+  private handleMessage(msg: ChannelMessage) {
+    if (msg.type === 'response' && msg.id) {
+      const pending = this.pending.get(msg.id)
+      if (pending) {
+        clearTimeout(pending.timeout)
+        this.pending.delete(msg.id)
+        if (msg.statusCode && msg.statusCode >= 400) {
+          pending.reject(new Error(msg.payload?.error || msg.error || 'Request failed'))
+        } else {
+          pending.resolve(msg.payload)
+        }
+      }
+      return
+    }
+
+    if (msg.type === 'command') {
+      this.emit('command', msg)
+      return
+    }
+    if (msg.type === 'command-result') {
+      this.emit('command-result', msg)
+      return
+    }
+    if (msg.type === 'event') {
+      this.emit('event', msg)
+      this.emit('message', msg)
+    }
+  }
+}
+
+export interface SecureChannelServerOptions {
+  wss: WebSocketServer
+  verifyClient?: (peerCert: any) => boolean
+  onRequest: (route: string, payload: any, raw: ChannelMessage) => Promise<any>
+}
+
+/**
+ * Lightweight server binder: attach to an existing WebSocketServer (with mTLS already configured).
+ */
+export function bindSecureChannelServer(options: SecureChannelServerOptions): void {
+  const { wss, verifyClient, onRequest } = options
+
+  wss.on('connection', (ws, req) => {
+    const cert = (req.socket as any).getPeerCertificate ? (req.socket as any).getPeerCertificate() : null
+    if (verifyClient && !verifyClient(cert)) {
+      ws.close(4001, 'Invalid client certificate')
+      return
+    }
+
+    ws.on('message', async (data: Buffer) => {
+      let msg: ChannelMessage | null = null
+      try {
+        msg = JSON.parse(data.toString()) as ChannelMessage
+      } catch {
+        return
+      }
+      if (!msg || msg.type !== 'request' || !msg.id || !msg.route) return
+
+      let statusCode = 200
+      let payload: any = null
+
+      try {
+        payload = await onRequest(msg.route, msg.payload, msg)
+      } catch (err: any) {
+        statusCode = 400
+        payload = { error: err?.message || 'Processing error' }
+      }
+
+      ws.send(
+        JSON.stringify({
+          type: 'response',
+          id: msg.id,
+          statusCode,
+          payload,
+        })
+      )
+    })
+  })
 }
 
