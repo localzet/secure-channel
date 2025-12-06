@@ -217,7 +217,7 @@ export class SecureChannelClient extends EventEmitter {
 export interface SecureChannelServerOptions {
   wss: WebSocketServer
   verifyClient?: (peerCert: any) => boolean
-  onRequest: (route: string, payload: any, raw: ChannelMessage) => Promise<any>
+  onRequest: (route: string, payload: any, raw: ChannelMessage, ws?: any) => Promise<any>
   maxSkewMs?: number
   nonceTtlMs?: number
   nonceCacheSize?: number
@@ -274,7 +274,7 @@ export function bindSecureChannelServer(options: SecureChannelServerOptions): vo
       let payload: any = null
 
       try {
-        payload = await onRequest(msg.route, msg.payload, msg)
+        payload = await onRequest(msg.route, msg.payload, msg, ws)
       } catch (err: any) {
         statusCode = 400
         payload = { error: err?.message || 'Processing error' }
