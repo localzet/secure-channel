@@ -73,10 +73,18 @@ export class SecureChannelClient extends EventEmitter {
 
   async connect(): Promise<void> {
     return new Promise((resolve, reject) => {
-      const wsUrl = this.opts.url.replace(/^http(s?)/, 'ws$1')
-      const target = wsUrl.endsWith('/')
-        ? `${wsUrl}secure-channel/${this.opts.serviceId}`
-        : `${wsUrl}/secure-channel/${this.opts.serviceId}`
+      // URL уже должен быть полным (wss://host:port/secure-channel/:serviceId/:uuid)
+      // Если это обычный URL без пути, добавляем путь
+      let target = this.opts.url
+      if (!target.includes('/secure-channel/')) {
+        const wsUrl = this.opts.url.replace(/^http(s?)/, 'ws$1')
+        target = wsUrl.endsWith('/')
+          ? `${wsUrl}secure-channel/${this.opts.serviceId}`
+          : `${wsUrl}/secure-channel/${this.opts.serviceId}`
+      } else {
+        // URL уже содержит путь, просто конвертируем http(s) в ws(s)
+        target = this.opts.url.replace(/^http(s?)/, 'ws$1')
+      }
 
       const ws = new WebSocket(target, {
         cert: this.opts.certificate,
