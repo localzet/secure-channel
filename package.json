@@ -27,7 +27,7 @@
     "access": "public"
   },
   "dependencies": {
-    "ws": "^8.18.0"
+    "ws": "^8.20.1"
   },
   "devDependencies": {
     "@types/ws": "^8.5.13",
