@@ -21,7 +21,8 @@
   },
   "scripts": {
     "build": "tsc",
-    "dev": "tsc --watch"
+    "dev": "tsc --watch",
+    "test": "npm run build && node --test tests/*.test.cjs"
   },
   "publishConfig": {
     "access": "public"

@@ -58,6 +58,9 @@ export class SecureChannelClient extends EventEmitter {
     { resolve: (v: any) => void; reject: (e: any) => void; timeout: NodeJS.Timeout }
   >()
   private readonly nonces = new Map<string, number>()
+  private manuallyDisconnected = false
+  private connecting: Promise<void> | null = null
+  private reconnectTimer: NodeJS.Timeout | null = null
 
   constructor(options: SecureChannelClientOptions) {
     super()
@@ -72,28 +75,30 @@ export class SecureChannelClient extends EventEmitter {
   }
 
   async connect(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      // URL уже должен быть полным (wss://host:port/secure-channel/:serviceId/:uuid)
-      // Если это обычный URL без пути, добавляем путь
-      let target = this.opts.url
-      if (!target.includes('/secure-channel/')) {
-        const wsUrl = this.opts.url.replace(/^http(s?)/, 'ws$1')
-        target = wsUrl.endsWith('/')
-          ? `${wsUrl}secure-channel/${this.opts.serviceId}`
-          : `${wsUrl}/secure-channel/${this.opts.serviceId}`
-      } else {
-        // URL уже содержит путь, просто конвертируем http(s) в ws(s)
-        target = this.opts.url.replace(/^http(s?)/, 'ws$1')
-      }
+    if (this.connected) return
+    if (this.connecting) return this.connecting
+    this.manuallyDisconnected = false
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
+    const target = new URL(this.opts.url)
+    if (target.protocol === 'https:') target.protocol = 'wss:'
+    if (target.protocol !== 'wss:') throw new Error('Secure Channel requires a wss:// or https:// URL')
+    if (!target.pathname.includes('/secure-channel/')) {
+      target.pathname = `${target.pathname.replace(/\/$/, '')}/secure-channel/${encodeURIComponent(this.opts.serviceId)}`
+    }
+    const connection = new Promise<void>((resolve, reject) => {
+      let opened = false
 
       const ws = new WebSocket(target, {
         cert: this.opts.certificate,
         key: this.opts.privateKey,
         ca: this.opts.caCertificate ? [this.opts.caCertificate] : undefined,
-        rejectUnauthorized: !!this.opts.caCertificate,
+        rejectUnauthorized: true,
       })
+      this.ws = ws
 
       ws.on('open', () => {
+        opened = true
         this.ws = ws
         this.connected = true
         this.emit('connected')
@@ -105,22 +110,37 @@ export class SecureChannelClient extends EventEmitter {
           const msg = JSON.parse(data.toString()) as ChannelMessage
           this.handleMessage(msg)
         } catch (err) {
-          this.emit('error', err)
+          if (this.listenerCount('error')) this.emit('error', err)
         }
       })
 
       ws.on('error', (err) => {
         this.connected = false
-        this.emit('error', err)
+        if (this.listenerCount('error')) this.emit('error', err)
         reject(err)
       })
 
       ws.on('close', () => {
+        if (this.ws !== ws) return
+        this.ws = null
         this.connected = false
+        this.rejectPending('Channel disconnected')
+        if (!opened) reject(new Error('Channel closed before connection completed'))
         this.emit('disconnected')
-        setTimeout(() => this.connect().catch(() => {}), this.opts.reconnectDelayMs)
+        if (!this.manuallyDisconnected) {
+          this.reconnectTimer = setTimeout(() => {
+            this.reconnectTimer = null
+            void this.connect().catch(() => {})
+          }, this.opts.reconnectDelayMs)
+        }
       })
     })
+    this.connecting = connection
+    try {
+      await connection
+    } finally {
+      if (this.connecting === connection) this.connecting = null
+    }
   }
 
   async request(options: RequestOptions): Promise<any> {
@@ -148,15 +168,22 @@ export class SecureChannelClient extends EventEmitter {
         route: options.route,
         expectReply,
         headers: {
+          ...options.headers,
           'x-sc-ts': now.toString(),
           'x-sc-nonce': nonce,
-          ...options.headers,
         },
         payload: options.payload,
       }
-      this.ws!.send(JSON.stringify(msg))
-
-      if (!expectReply) resolve({ accepted: true })
+      this.ws!.send(JSON.stringify(msg), (error) => {
+        if (error) {
+          const pending = this.pending.get(id)
+          if (pending) clearTimeout(pending.timeout)
+          this.pending.delete(id)
+          reject(error)
+        } else if (!expectReply) {
+          resolve({ accepted: true })
+        }
+      })
     })
   }
 
@@ -176,14 +203,20 @@ export class SecureChannelClient extends EventEmitter {
   }
 
   disconnect(): void {
+    this.manuallyDisconnected = true
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = null
     if (this.ws) {
       this.ws.close()
-      this.ws = null
     }
     this.connected = false
+    this.rejectPending('Channel disconnected')
+  }
+
+  private rejectPending(reason: string): void {
     this.pending.forEach(({ timeout, reject }) => {
       clearTimeout(timeout)
-      reject(new Error('Channel disconnected'))
+      reject(new Error(reason))
     })
     this.pending.clear()
   }
@@ -239,16 +272,24 @@ export function bindSecureChannelServer(options: SecureChannelServerOptions): vo
   const maxSkewMs = options.maxSkewMs ?? 30_000
   const nonceTtlMs = options.nonceTtlMs ?? 60_000
   const nonceCacheSize = options.nonceCacheSize ?? 10_000
+  if (!Number.isFinite(maxSkewMs) || maxSkewMs < 0 || !Number.isFinite(nonceTtlMs) || nonceTtlMs < 2 * maxSkewMs || !Number.isSafeInteger(nonceCacheSize) || nonceCacheSize < 1) {
+    throw new Error('Invalid replay protection limits')
+  }
   const seenNonces = new Map<string, number>()
 
   wss.on('connection', (ws, req) => {
     const cert = (req.socket as any).getPeerCertificate ? (req.socket as any).getPeerCertificate() : null
-    if ((req.socket as any).authorized === false) {
+    if ((req.socket as any).authorized !== true) {
       ws.close(4001, 'Unauthorized client certificate')
       return
     }
-    if (verifyClient && !verifyClient(cert)) {
-      ws.close(4001, 'Invalid client certificate')
+    try {
+      if (verifyClient && !verifyClient(cert)) {
+        ws.close(4001, 'Invalid client certificate')
+        return
+      }
+    } catch {
+      ws.close(4001, 'Client certificate verification failed')
       return
     }
 
@@ -259,24 +300,20 @@ export function bindSecureChannelServer(options: SecureChannelServerOptions): vo
       } catch {
         return
       }
-      if (!msg || msg.type !== 'request' || !msg.id || !msg.route) return
+      if (!msg || msg.type !== 'request' || typeof msg.id !== 'string' || !msg.id || typeof msg.route !== 'string' || !msg.route) return
 
       // Anti-replay: timestamp + nonce window
       const tsStr = msg.headers?.['x-sc-ts']
       const nonce = msg.headers?.['x-sc-nonce']
       const now = Date.now()
-      if (!tsStr || !nonce) return
+      if (typeof tsStr !== 'string' || typeof nonce !== 'string' || !nonce || nonce.length > 128) return
       const ts = Number(tsStr)
       if (!Number.isFinite(ts) || Math.abs(now - ts) > maxSkewMs) return
-      // purge old nonces
-      if (seenNonces.size > nonceCacheSize) {
-        const cutoff = now - nonceTtlMs
-        for (const [n, t] of seenNonces) {
-          if (t < cutoff) seenNonces.delete(n)
-        }
+      for (const [n, expiresAt] of seenNonces) {
+        if (expiresAt <= now) seenNonces.delete(n)
       }
-      if (seenNonces.has(nonce)) return
-      seenNonces.set(nonce, ts)
+      if (seenNonces.has(nonce) || seenNonces.size >= nonceCacheSize) return
+      seenNonces.set(nonce, now + nonceTtlMs)
 
       let statusCode = 200
       let payload: any = null
@@ -285,18 +322,19 @@ export function bindSecureChannelServer(options: SecureChannelServerOptions): vo
         payload = await onRequest(msg.route, msg.payload, msg, ws)
       } catch (err: any) {
         statusCode = 400
-        payload = { error: err?.message || 'Processing error' }
+        payload = { error: 'Processing error' }
       }
 
+      if (ws.readyState !== WebSocket.OPEN) return
       ws.send(
         JSON.stringify({
           type: 'response',
           id: msg.id,
           statusCode,
           payload,
-        })
+        }),
+        (error) => { if (error) ws.close(1011, 'Response delivery failed') }
       )
     })
   })
 }
-
