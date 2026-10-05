@@ -48,3 +48,7 @@ Replay protection rejects reused nonces, stale timestamps and requests when its 
 ## Development
 
 `npm test` builds the package and runs network tests with ephemeral certificates generated outside the repository. `npm run build` produces `dist/`. No registry release is performed by CI. Breaking security corrections should be reviewed by consumers before upgrading.
+
+## Attribution
+
+Maintainer of Localzet contributions: **Ivan Zorin (localzet)** — <creator@localzet.com> · https://www.localzet.com. Copyright © 2026 Localzet Group. Original authorship and third-party licenses remain applicable. See [AUTHORS](.github/AUTHORS.md).

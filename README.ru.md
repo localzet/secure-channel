@@ -48,3 +48,7 @@ try {
 ## Разработка
 
 `npm test` собирает пакет и выполняет сетевые тесты с временными сертификатами вне репозитория. `npm run build` создаёт `dist/`. CI не публикует пакет в реестр. Перед обновлением проверьте совместимость потребителей с исправлениями безопасности.
+
+## Attribution
+
+Maintainer of Localzet contributions: **Ivan Zorin (localzet)** — <creator@localzet.com> · https://www.localzet.com. Copyright © 2026 Localzet Group. Original authorship and third-party licenses remain applicable. See [AUTHORS](.github/AUTHORS.md).
