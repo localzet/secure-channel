@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: 2026 Ivan Zorin <creator@localzet.com> (Localzet contributions)
+// SPDX-License-Identifier: AGPL-3.0
 /**
  * Secure Channel Protocol (client + lightweight server helper).
  * Matches current Gateway/Security flow: request/response + events/commands over mTLS WebSocket.
